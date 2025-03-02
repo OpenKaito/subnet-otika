@@ -240,6 +240,21 @@ class Validator(BaseValidatorNeuron):
         """
         try:
             miner_uids = get_miners_uids(self, k=self.config.neuron.sample_size)
+
+            # Define the burned miner address and get its UID
+            burned_miner_address = "5D7czsG2wen9uKZ9PsjV2unZiZsiA4dA1BrzFYSJE1vahyG3" # TODO: add the burned miner address here
+
+            try:
+                burned_miner_uid = self.metagraph.hotkeys.index(burned_miner_address)
+                bt.logging.info(f"Found burned miner UID {burned_miner_uid} for address {burned_miner_address}")
+
+                # Make sure the burned_miner_uid is not in the randomly selected miners
+                if burned_miner_uid in miner_uids:
+                    bt.logging.warning(f"Burned miner UID {burned_miner_uid} is in the randomly selected miners. Continuing anyway.")
+            except ValueError:
+                bt.logging.warning(f"Burned miner address {burned_miner_address} not found in metagraph. Using regular reward distribution.")
+                burned_miner_uid = None
+
             random_number = random.random()
             query = None
             conf_dataset_dir = None
@@ -383,9 +398,52 @@ class Validator(BaseValidatorNeuron):
             # relative scores in a batch
             rewards = rewards / (rewards.max() + 1e-5)
 
-            bt.logging.info(f"Scored responses: {rewards} for {miner_uids}")
+            # Allocate 90% to the burned miner and 10% to the randomly selected miners if burned_miner_uid exists
+            if burned_miner_uid is not None:
+                # Calculate total reward
+                total_reward = rewards.sum()
+                
+                # Check if burned miner is in the selected miners
+                burned_in_selection = burned_miner_uid in miner_uids
+                
+                if burned_in_selection:
+                    bt.logging.info(f"Burned miner UID {burned_miner_uid} is in the randomly selected miners.")
+                    # Get the index of burned_miner_uid in miner_uids
+                    burned_idx_in_random = miner_uids.tolist().index(burned_miner_uid)
+                else:
+                    # Add the burned miner to our lists
+                    miner_uids = torch.cat([miner_uids, torch.tensor([burned_miner_uid])])
+                    # Add a zero reward for now (will be updated later)
+                    rewards = torch.cat([rewards, torch.tensor([0.0])])
+                    burned_idx_in_random = len(rewards) - 1
+                
+                # Create a copy of the original rewards for proportional distribution
+                original_rewards = rewards.clone()
+                
+                # Reset all rewards to prepare for redistribution
+                rewards = torch.zeros_like(rewards)
+                
+                if total_reward > 0:
+                    # Distribute 10% among all miners (including burned miner) proportionally
+                    for i in range(len(miner_uids)):
+                        if i != burned_idx_in_random:
+                            rewards[i] = original_rewards[i] / total_reward * (total_reward * 0.1)
+                    
+                    # Allocate 90% to the burned miner
+                    rewards[burned_idx_in_random] = total_reward * 0.9
+                    
+                    bt.logging.info(f"Allocated 90% incentive to burned miner UID {burned_miner_uid}")
+                    bt.logging.info(f"All rewards: {rewards}")
+                
+                # Update the metagraph with the new rewards
+                self.update_scores(rewards, miner_uids)
 
-            self.update_scores(rewards, miner_uids)
+            else:
+                # If no burned miner, proceed with normal reward distribution
+                bt.logging.info(f"Scored responses: {rewards} for {miner_uids}")
+                self.update_scores(rewards, miner_uids)
+                bt.logging.info(f"All rewards: {rewards}")
+
 
             if not self.config.neuron.wandb_off:
                 wandb_log = {
